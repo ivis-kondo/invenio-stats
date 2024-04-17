@@ -44,6 +44,22 @@
           "type": "double",
           "index": "not_analyzed"
         },
+        "unique_id": {
+          "type": "string",
+          "index": "not_analyzed"
+        },
+        "country": {
+          "type": "string",
+          "index": "not_analyzed"
+        },
+        "item_id": {
+          "type": "string",
+          "index": "not_analyzed"
+        },
+        "item_title": {
+          "type": "string",
+          "index": "not_analyzed"
+        },
         "file_id": {
           "type": "string",
           "index": "not_analyzed"
@@ -56,7 +72,63 @@
           "type": "string",
           "index": "not_analyzed"
         },
+        "accessrole": {
+          "type": "string",
+          "index": "not_analyzed"
+        },
+        "userrole": {
+          "type": "string",
+          "index": "not_analyzed"
+        },
+        "site_license_name": {
+          "type": "string",
+          "index": "not_analyzed"
+        },
+        "site_license_flag": {
+          "type": "boolean",
+          "index": "not_analyzed"
+        },
+        "index_list": {
+          "type": "string",
+          "index": "not_analyzed"
+        },
         "collection": {
+          "type": "string",
+          "index": "not_analyzed"
+        },
+        "cur_user_id": {
+          "type": "string",
+          "index": "not_analyzed"
+        },
+        "is_billing_item": {
+          "type": "boolean",
+          "index": "not_analyzed"
+        },
+        "billing_file_price": {
+          "type": "string",
+          "index": "not_analyzed"
+        },
+        "user_group_names": {
+          "type": "string",
+          "index": "not_analyzed"
+        },
+        "user_group_list": {
+          "type": "nested",
+          "properties": {
+            "group_id": {
+              "type": "string"
+            },
+            "group_name": {
+              "type": "string",
+              "index": "not_analyzed"
+            }
+          }
+        },
+        "hostname": {
+          "type": "string",
+          "index": "not_analyzed"
+        },
+        "remote_addr": {
           "type": "string",
           "index": "not_analyzed"
         }

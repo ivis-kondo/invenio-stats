@@ -11,6 +11,7 @@
 from __future__ import absolute_import, print_function
 
 import hashlib
+from itertools import tee
 from time import mktime
 
 import arrow
@@ -20,12 +21,35 @@ from dateutil import parser
 from flask import current_app
 from invenio_search import current_search_client
 from pytz import utc
+from weko_admin.api import is_restricted_user
+from weko_admin.utils import get_redis_cache, reset_redis_cache, is_exists_key_in_redis
 
+from .models import StatsEvents
 from .utils import get_anonymization_salt, get_geoip, obj_or_import_string
 
 
 def anonymize_user(doc):
-    """Preprocess an event by anonymizing user information."""
+    """Preprocess an event by anonymizing user information.
+
+    The anonymization is done by removing fields that can uniquely identify a
+    user, such as the user's ID, session ID, IP address and User Agent, and
+    hashing them to produce a ``visitor_id`` and ``unique_session_id``. To
+    further secure the method, a randomly generated 32-byte salt is used, that
+    expires after 24 hours and is discarded. The salt values are stored in
+    Redis (or whichever backend Invenio-Cache uses). The ``unique_session_id``
+    is calculated in the same way as the ``visitor_id``, with the only
+    difference that it also takes into account the hour of the event . All of
+    these rules effectively mean that a user can have a unique ``visitor_id``
+    for each day and unique ``unique_session_id`` for each hour of a day.
+
+    This session ID generation process was designed according to the `Project
+    COUNTER Code of Practice <https://www.projectcounter.org/code-of-
+    practice-sections/general-information/>`_.
+
+    In addition to that the country of the user is extracted from the IP
+    address as a ISO 3166-1 alpha-2 two-letter country code (e.g. "CH" for
+    Switzerland).
+    """
     ip = doc.pop('ip_address', None)
     if ip:
         doc.update({'country': get_geoip(ip)})
@@ -75,14 +99,43 @@ def anonymize_user(doc):
     return doc
 
 
+def flag_restricted(doc):
+    """Mark restricted access."""
+    doc['is_restricted'] = False
+    if 'ip_address' in doc and 'user_agent' in doc:
+        user_data = {
+            'ip_address': doc['ip_address'],
+            'user_agent': doc['user_agent']
+        }
+        doc['is_restricted'] = is_restricted_user(user_data)
+    return doc
+
+
 def flag_robots(doc):
-    """Flag events which are created by robots."""
+    """Flag events which are created by robots.
+
+    The list of robots is defined by the `COUNTER-robots Python package
+    <https://github.com/inveniosoftware/counter-robots>`_ , which follows the
+    `list defined by Project COUNTER
+    <https://www.projectcounter.org/appendices/850-2/>`_ that was later split
+    into robots and machines by `the Make Data Count project
+    <https://github.com/CDLUC3/Make-Data-Count/tree/master/user-agents>`_.
+    """
     doc['is_robot'] = 'user_agent' in doc and is_robot(doc['user_agent'])
     return doc
 
 
 def flag_machines(doc):
-    """Flag events which are created by machines."""
+    """Flag events which are created by machines.
+
+    The list of machines is defined by the `COUNTER-robots Python package
+    <https://github.com/inveniosoftware/counter-robots>`_ , which follows the
+    `list defined by Project COUNTER
+    <https://www.projectcounter.org/appendices/850-2/>`_ that was later split
+    into robots and machines by `the Make Data Count project
+    <https://github.com/CDLUC3/Make-Data-Count/tree/master/user-agents>`_.
+
+    """
     doc['is_machine'] = 'user_agent' in doc and is_machine(doc['user_agent'])
     return doc
 
@@ -91,8 +144,8 @@ def hash_id(iso_timestamp, msg):
     """Generate event id, optimized for ES."""
     return '{0}-{1}'.format(iso_timestamp,
                             hashlib.sha1(
-                                msg.get('unique_id').encode('utf-8') +
-                                str(msg.get('visitor_id')).
+                                msg.get('unique_id').encode('utf-8')
+                                + str(msg.get('visitor_id')).
                                 encode('utf-8')).
                             hexdigest())
 
@@ -123,7 +176,10 @@ class EventsIndexer(object):
         self.queue = queue
         self.client = client or current_search_client
         self.doctype = queue.routing_key
-        self.index = '{0}-{1}'.format(prefix, self.queue.routing_key)
+        self.search_index_prefix = current_app.config['SEARCH_INDEX_PREFIX'] \
+            .strip('-')
+        self.index = '{0}-{1}-{2}'.format(self.search_index_prefix, prefix,
+                                          self.queue.routing_key)
         self.suffix = suffix
         # load the preprocessors
         self.preprocessors = [
@@ -141,27 +197,40 @@ class EventsIndexer(object):
                         break
                 if msg is None:
                     continue
+                
+                # msg:
+                # {'timestamp': '2022-07-28T05:06:38.082518', 'record_id': '1857c219-6ff1-45c0-8e3c-85e1fb15305c', 'record_name': 'ja_conference paperITEM00000010(public_open_access_open_access_simple)', 'record_index_list': [{'index_id': '1658073625012', 'index_name': 'IndexB', 'index_name_en': 'IndexB'}, {'index_id': '1658883231990', 'index_name': 'IndexA', 'index_name_en': 'IndexA'}], 'pid_type': 'recid', 'pid_value': '10', 'referrer': 'https://localhost:8443/?page=1&size=20&sort=controlnumber', 'cur_user_id': 'guest', 'remote_addr': '10.0.2.2', 'site_license_flag': False, 'site_license_name': '', 'is_restricted': False, 'is_robot': False, 'country': None, 'visitor_id': '7d9fad5b86c69dce8f011e041be8852f2ab8a41ad8c46c290c7c82ce', 'unique_session_id': '7d9fad5b86c69dce8f011e041be8852f2ab8a41ad8c46c290c7c82ce', 'unique_id': '033103b8-2793-3d95-8c8f-d06abfda7ce4', 'hostname': '_gateway'}
+                # suffix: %Y
+                # double_click_window: 30
                 suffix = arrow.get(msg.get('timestamp')).strftime(self.suffix)
                 ts = parser.parse(msg.get('timestamp'))
+                
                 # Truncate timestamp to keep only seconds. This is to improve
                 # elasticsearch performances.
                 ts = ts.replace(microsecond=0)
+                
                 msg['timestamp'] = ts.isoformat()
                 # apply timestamp windowing in order to group events too close
                 # in time
                 if self.double_click_window > 0:
                     timestamp = mktime(utc.localize(ts).utctimetuple())
                     ts = ts.fromtimestamp(
-                        timestamp // self.double_click_window *
-                        self.double_click_window
+                        timestamp // self.double_click_window
+                        * self.double_click_window
                     )
-                yield dict(
+
+                rtn_data = dict(
                     _id=hash_id(ts.isoformat(), msg),
                     _op_type='index',
-                    _index='{0}-{1}'.format(self.index, suffix),
+                    _index='{0}'.format(self.index),
                     _type=self.doctype,
                     _source=msg,
                 )
+                if current_app.config['STATS_WEKO_DB_BACKUP_EVENTS']:
+                    # Save stats event into Database.
+                    StatsEvents.save(rtn_data, True)
+
+                yield rtn_data
             except Exception:
                 current_app.logger.exception(u'Error while processing event')
 
